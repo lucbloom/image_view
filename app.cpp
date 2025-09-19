@@ -40,10 +40,11 @@ static std::mutex g_filesMutex;
 static std::atomic<int> g_index{ 0 };
 static std::map<std::wstring, std::shared_ptr<Bitmap>> g_cache;
 static std::mutex g_cacheMutex;
-static std::atomic<bool> g_loading{ false };
 static std::atomic<DWORD> g_zoom{ 2 };
+static std::atomic<bool> g_loading{ false };
 static std::atomic<bool> g_stopThreads{ false };
 static int g_frameIndex = 0;
+static bool g_isInitialized = false;
 
 static void ChooseRootDirectory()
 {
@@ -118,21 +119,21 @@ static std::wstring RawFormatToType(const GUID& g)
 	return L"Unknown";
 }
 
-static void EnumFiles(const std::wstring& root, bool recursive)
+static void EnumFiles()
 {
 	std::vector<fs::path> files;
 	try
 	{
-		if (recursive)
+		if (g_recursive)
 		{
-			for (auto& p : fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied))
+			for (auto& p : fs::recursive_directory_iterator(g_rootPath, fs::directory_options::skip_permission_denied))
 			{
 				if (p.is_regular_file() && has_ext(p.path())) files.push_back(p.path());
 			}
 		}
 		else
 		{
-			for (auto& p : fs::directory_iterator(root))
+			for (auto& p : fs::directory_iterator(g_rootPath))
 			{
 				if (p.is_regular_file() && has_ext(p.path())) files.push_back(p.path());
 			}
@@ -501,8 +502,69 @@ static void UpdateInfoLabel()
 	LoadNextBitmap();
 }
 
+struct PhotoshopInstall
+{
+	std::wstring Version;
+	std::wstring Path;
+};
+
+// Helper to convert version string "23.0" → major * 1000 + minor for sorting
+int VersionToInt(const std::wstring& ver)
+{
+	int major = 0, minor = 0;
+	swscanf_s(ver.c_str(), L"%d.%d", &major, &minor);
+	return major * 1000 + minor;
+}
+
 static void DoOpenWith(const std::wstring& exeHint)
 {
+	std::vector<PhotoshopInstall> installs;
+	HKEY hKey;
+
+	REGSAM views[] = { KEY_WOW64_64KEY, KEY_WOW64_32KEY };
+	for (auto view : views)
+	{
+		if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Adobe\\Photoshop", 0,
+			KEY_READ | view, &hKey) == ERROR_SUCCESS)
+		{
+			DWORD index = 0;
+			wchar_t subKeyName[256];
+			DWORD subKeySize = _countof(subKeyName);
+
+			while (RegEnumKeyExW(hKey, index, subKeyName, &subKeySize, nullptr,
+				nullptr, nullptr, nullptr) == ERROR_SUCCESS)
+			{
+				HKEY hSubKey;
+				if (RegOpenKeyExW(hKey, subKeyName, 0, KEY_READ, &hSubKey) == ERROR_SUCCESS)
+				{
+					wchar_t path[MAX_PATH];
+					DWORD size = sizeof(path);
+					if (RegQueryValueExW(hSubKey, L"ApplicationPath", nullptr, nullptr,
+						reinterpret_cast<LPBYTE>(path), &size) == ERROR_SUCCESS)
+					{
+						installs.push_back({ subKeyName, path });
+					}
+					RegCloseKey(hSubKey);
+				}
+
+				index++;
+				subKeySize = _countof(subKeyName);
+			}
+
+			RegCloseKey(hKey);
+		}
+	}
+
+	if (installs.empty()) return;
+
+	std::sort(installs.begin(), installs.end(), [](const PhotoshopInstall& a, const PhotoshopInstall& b) {
+		return VersionToInt(a.Version) > VersionToInt(b.Version);
+	});
+
+	// Take the latest version
+	std::filesystem::path photoshopExe = installs.front().Path;
+	photoshopExe /= L"Photoshop.exe";
+
 	fs::path file;
 	{
 		std::lock_guard<std::mutex> lk(g_filesMutex);
@@ -510,68 +572,107 @@ static void DoOpenWith(const std::wstring& exeHint)
 		file = g_files[g_index];
 	}
 
-	// try candidate locations
-	std::wstring candidates[] = {
-		exeHint,
-		L"C:\\Program Files\\Adobe\\Adobe Photoshop 2023\\Photoshop.exe",
-		L"C:\\Program Files\\Adobe\\Adobe Photoshop 2024\\Photoshop.exe",
-		L"C:\\Program Files\\Adobe\\Adobe Photoshop 2022\\Photoshop.exe",
-		L"C:\\Program Files\\paint.net\\PaintDotNet.exe",
-		L"C:\\Program Files (x86)\\paint.net\\PaintDotNet.exe"
-	};
-	// first try exeHint as verb (open with application)
-	for (auto& c : candidates)
-	{
-		if (c.empty()) continue;
-		if (PathFileExistsW(c.c_str()))
-		{
-			SHELLEXECUTEINFOW si = { sizeof(si) };
-			si.fMask = SEE_MASK_NOCLOSEPROCESS;
-			si.lpVerb = L"open";
-			si.lpFile = c.c_str();
-			auto arg = file.wstring();
-			si.lpParameters = arg.c_str();
-			ShellExecuteExW(&si);
-			return;
-		}
-	}
-	// fallback: use "open" with file association (will open default)
-	ShellExecuteW(NULL, L"open", file.wstring().c_str(), NULL, NULL, SW_SHOWNORMAL);
+	std::wstring command = L"\"" + photoshopExe.wstring() + L"\" \"" + file.wstring() + L"\"";
+	_wsystem(command.c_str()); // launches Photoshop with the file
 }
 
-static void CopyToClipboardAsGif(const fs::path& file)
+HGLOBAL CreateDIBV5FromBitmap(std::shared_ptr<Gdiplus::Bitmap> bmp)
 {
-	// save current image as GIF to temp and put path in clipboard as HDROP (so user can paste file)
-	std::wstring tmp = fs::temp_directory_path().wstring() + L"\\iv_tmp.gif";
-	std::shared_ptr<Bitmap> bmp = GetBitmapAt(g_index);
-	if (!bmp) return;
-	CLSID cls = GetEncoderClsid(L"image/gif");
-	bmp->Save(tmp.c_str(), &cls, nullptr);
-	// put file path on clipboard as CF_HDROP
-	//OPENFILENAMEW ofn; // not used, just prepare
-	HGLOBAL hMem = GlobalAlloc(GHND | GMEM_SHARE, (tmp.size() + 2) * sizeof(wchar_t));
-	if (!hMem) return;
-	wchar_t* p = (wchar_t*)GlobalLock(hMem);
-	wcscpy_s(p, tmp.size() + 2, tmp.c_str());
+	if (!bmp) return nullptr;
+
+	UINT w = bmp->GetWidth();
+	UINT h = bmp->GetHeight();
+
+	BITMAPV5HEADER bvh = {};
+	bvh.bV5Size = sizeof(BITMAPV5HEADER);
+	bvh.bV5Width = w;
+	bvh.bV5Height = -(LONG)h; // top-down
+	bvh.bV5Planes = 1;
+	bvh.bV5BitCount = 32;
+	bvh.bV5Compression = BI_BITFIELDS;
+	bvh.bV5RedMask = 0x00FF0000;
+	bvh.bV5GreenMask = 0x0000FF00;
+	bvh.bV5BlueMask = 0x000000FF;
+	bvh.bV5AlphaMask = 0xFF000000;
+
+	const size_t rowBytes = w * 4;
+	const size_t imgSize = rowBytes * h;
+	const size_t totalSize = sizeof(BITMAPV5HEADER) + imgSize;
+
+	HGLOBAL hMem = GlobalAlloc(GHND | GMEM_MOVEABLE, totalSize);
+	if (!hMem) return nullptr;
+
+	void* pMem = GlobalLock(hMem);
+	memcpy(pMem, &bvh, sizeof(BITMAPV5HEADER));
+
+	Gdiplus::BitmapData data;
+	Gdiplus::Rect rect(0, 0, w, h);
+	bmp->LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &data);
+
+	BYTE* dst = (BYTE*)pMem + sizeof(BITMAPV5HEADER);
+	for (UINT y = 0; y < h; y++)
+	{
+		memcpy(dst + y * rowBytes, (BYTE*)data.Scan0 + y * data.Stride, rowBytes);
+	}
+
+	bmp->UnlockBits(&data);
 	GlobalUnlock(hMem);
-	// prepare DROPFILES structure
-	size_t pathLen = tmp.size() + 1;
-	size_t total = sizeof(DROPFILES) + (pathLen + 1) * sizeof(wchar_t);
-	HGLOBAL hg = GlobalAlloc(GHND | GMEM_MOVEABLE, total);
-	if (!hg) return;
-	void* pv = GlobalLock(hg);
-	DROPFILES* df = (DROPFILES*)pv;
-	df->pFiles = sizeof(DROPFILES);
-	df->pt.x = df->pt.y = 0;
-	df->fWide = TRUE;
-	wchar_t* dst = (wchar_t*)((char*)pv + sizeof(DROPFILES));
-	wcscpy_s(dst, pathLen + 1, tmp.c_str());
-	GlobalUnlock(hg);
+	return hMem;
+}
+
+static void CopyToClipboard()
+{
+	fs::path file;
+	{
+		std::lock_guard<std::mutex> lk(g_filesMutex);
+		if (g_files.empty()) return;
+		file = g_files[g_index];
+	}
+
+	std::shared_ptr<Gdiplus::Bitmap> bmp = GetBitmapAt(g_index);
+	if (!bmp) return;
+
+	const std::wstring originalPath = file.wstring();
+	size_t requiredPathCharacterCopyCount = originalPath.size() + 1; // includes null terminator
+
+	// --- DROPFILES ---
+	size_t dropSize = sizeof(DROPFILES) + requiredPathCharacterCopyCount * sizeof(wchar_t);
+	HGLOBAL hDrop = GlobalAlloc(GHND | GMEM_MOVEABLE, dropSize);
+	if (hDrop)
+	{
+		DROPFILES* df = (DROPFILES*)GlobalLock(hDrop);
+		df->pFiles = sizeof(DROPFILES);
+		df->fWide = TRUE;
+		wcscpy_s((wchar_t*)((BYTE*)df + sizeof(DROPFILES)), requiredPathCharacterCopyCount, originalPath.c_str());
+		GlobalUnlock(hDrop);
+	}
+
+	// --- UNICODETEXT ---
+	HGLOBAL hText = GlobalAlloc(GHND | GMEM_MOVEABLE, requiredPathCharacterCopyCount * sizeof(wchar_t));
+	if (hText)
+	{
+		wchar_t* pText = (wchar_t*)GlobalLock(hText);
+		wcscpy_s(pText, requiredPathCharacterCopyCount, originalPath.c_str());
+		GlobalUnlock(hText);
+	}
+
+	// --- Optional DIBV5 ---
+	HGLOBAL hDib = CreateDIBV5FromBitmap(bmp);
+
+	// --- Set clipboard ---
 	if (OpenClipboard(nullptr))
 	{
 		EmptyClipboard();
-		SetClipboardData(CF_HDROP, hg);
+		if (hDrop) SetClipboardData(CF_HDROP, hDrop); // Slack, ChatGPT prompt
+		if (hDib) SetClipboardData(CF_DIBV5, hDib); // Photoshop :-(
+		if (hText) SetClipboardData(CF_UNICODETEXT, hText); // Notepad++, text fields
 		CloseClipboard();
+	}
+	else
+	{
+		GlobalFree(hDrop);
+		GlobalFree(hText);
+		//if (hDib) GlobalFree(hDib);
 	}
 }
 
@@ -590,7 +691,7 @@ static void DeleteCurrent()
 		fo.pFrom = p.c_str();
 		fo.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION;
 		SHFileOperationW(&fo);
-		EnumFiles(g_rootPath[0] ? g_rootPath : fs::current_path().wstring(), g_recursive);
+		EnumFiles();
 	}
 }
 
@@ -717,6 +818,24 @@ LRESULT CALLBACK PanelProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	return CallWindowProc(g_oldPanelProc, hWnd, msg, wParam, lParam);
 }
 
+void SaveWindowPlacement()
+{
+	if (!g_isInitialized) return;
+
+	WINDOWPLACEMENT wp = { sizeof(wp) };
+	GetWindowPlacement(g_hMain, &wp);
+
+	if (wp.showCmd)
+	{
+		HKEY hKey;
+		if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\ImageViewer", 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS)
+		{
+			RegSetValueExW(hKey, L"WindowPlacement", 0, REG_BINARY, reinterpret_cast<const BYTE*>(&wp), sizeof(wp));
+			RegCloseKey(hKey);
+		}
+	}
+}
+
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -747,6 +866,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		InvalidateRect(g_hPanel, NULL, TRUE);
 		return 0;
 	}
+
 	case WM_PAINT:
 	{
 		PAINTSTRUCT ps;
@@ -755,29 +875,28 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		GetClientRect(hWnd, &rc);
 		FillRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
 		EndPaint(hWnd, &ps);
-	} break;
+		break;
+	}
+
 	case WM_COMMAND:
 	{
 		switch (LOWORD(wParam))
 		{
 		case 101: PrevImage(); break;
 		case 102: NextImage(); break;
+
 		case 103: // photoshop
-		{
 			DoOpenWith(L"C:\\Program Files\\Adobe\\Adobe Photoshop 2023\\Photoshop.exe");
-		}
-		break;
+			break;
 
 		case 104: // paint.net
-		{
 			DoOpenWith(L"C:\\Program Files\\paint.net\\PaintDotNet.exe");
-		}
-		break;
+			break;
+		
 		case 105: // explorer
-		{
 			OpenInExplorer();
-		}
-		break;
+			break;
+
 		case 106: // toggle 100%
 		{
 			g_zoom = (g_zoom + 1) % 3;
@@ -787,63 +906,84 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			InvalidateRect(g_hPanel, NULL, TRUE);
 			break;
 		}
+
 		case 107: // toggle recursive
 		{
 			g_recursive = !g_recursive;
 			DWORD v = g_recursive;
 			RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\ImageViewer", L"Recursive", REG_DWORD, &v, sizeof(DWORD));
 			SetWindowTextW(g_hToggleRec, g_recursive ? L"Recursive: On" : L"Recursive: Off");
-			EnumFiles(g_rootPath[0] ? g_rootPath : fs::current_path().wstring(), g_recursive);
+			EnumFiles();
 			UpdateInfoLabel();
 			InvalidateRect(g_hPanel, NULL, TRUE);
 			break;
 		}
+
 		case 108: // rotate + resave exif
 			Rotate90AndResave(true);
-			EnumFiles(g_rootPath[0] ? g_rootPath : fs::current_path().wstring(), g_recursive);
+			EnumFiles();
 			UpdateInfoLabel();
 			InvalidateRect(g_hPanel, NULL, TRUE);
 			break;
+
 		case 109: // copy gif
-		{
-			std::lock_guard<std::mutex> lk(g_filesMutex);
-			if (!g_files.empty()) CopyToClipboardAsGif(g_files[g_index]);
-		}
-		break;
+			CopyToClipboard();
+			break;
+
 		case 110: // delete
 			DeleteCurrent();
 			UpdateInfoLabel();
 			InvalidateRect(g_hPanel, NULL, TRUE);
 			break;
+
 		case 111: // change root
 			ChooseRootDirectory();
-			EnumFiles(g_rootPath[0] ? g_rootPath : fs::current_path().wstring(), g_recursive);
+			EnumFiles();
 			UpdateInfoLabel();
 			InvalidateRect(g_hPanel, NULL, TRUE);
 			break;
 		}
 		return 0;
 	}
+
 	case WM_TIMER:
 		if (wParam == g_gifTimerId)
 		{
 			QueueNextFrame();
 		}
 		break;
+
 	case WM_KEYDOWN:
+	{
+		bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
 		switch (wParam)
 		{
+		case 'C':
+			if (ctrl) CopyToClipboard();
+			break;
+
+		case VK_DELETE:
+			DeleteCurrent();
+			break;
+
 		case VK_LEFT:
 		case VK_PRIOR: // Page Up
 			PrevImage();
 			break;
+
 		case VK_RIGHT:
 		case VK_NEXT: // Page Down
 			NextImage();
 			break;
+
 		case VK_OEM_COMMA: Rotate90AndResave(false); break; // '<' rotate left
 		case VK_OEM_PERIOD: Rotate90AndResave(true); break;  // '>' rotate right (clockwise)
 		}
+		break;
+	}
+
+	case WM_MOVE:
+		SaveWindowPlacement();
 		break;
 
 	case WM_SIZE:
@@ -863,8 +1003,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		MoveWindow(g_hInfo, 520, r.bottom - 160, r.right - 540, 150, TRUE);
 		MoveWindow(g_hChangeRoot, 250, r.bottom - 120, 120, 28, TRUE);
 		InvalidateRect(g_hPanel, NULL, TRUE);
+		SaveWindowPlacement();
 		return 0;
 	}
+
 	case WM_DESTROY:
 		g_loading = false;
 		StopBackground();
@@ -873,7 +1015,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	}
 
 	auto r = DefWindowProcW(hWnd, msg, wParam, lParam);
-	SetFocus(hWnd);
+
+	if (GetFocus() != g_hInfo &&
+		msg != WM_DESTROY &&
+		msg != WM_ACTIVATEAPP &&
+		msg != WM_ACTIVATE)
+	{
+		SetFocus(hWnd);
+	}
 	return r;
 }
 
@@ -935,7 +1084,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
 
 	if (wcslen(g_rootPath))
 	{
-		EnumFiles(g_rootPath, g_recursive);
+		EnumFiles();
 	}
 
 	WNDCLASSEXW wc = { sizeof(wc) };
@@ -949,12 +1098,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
 	g_hMain = CreateWindowExW(0, wc.lpszClassName, L"Minimal Image Viewer", WS_OVERLAPPEDWINDOW,
 		CW_USEDEFAULT, CW_USEDEFAULT, 1000, 820, NULL, NULL, hInstance, NULL);
 
-	ShowWindow(g_hMain, nCmdShow);
+	WINDOWPLACEMENT wp = { sizeof(wp) };
+	wp.showCmd = nCmdShow;
+	HKEY hKey;
+	DWORD size = sizeof(wp);
+	if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\ImageViewer", 0, KEY_READ, &hKey) == ERROR_SUCCESS)
+	{
+		RegQueryValueExW(hKey, L"WindowPlacement", nullptr, nullptr, reinterpret_cast<BYTE*>(&wp), &size);
+		RegCloseKey(hKey);
+		SetWindowPlacement(g_hMain, &wp);
+	}
+
+	ShowWindow(g_hMain, wp.showCmd);
 	UpdateWindow(g_hMain);
 
-	// start loader std::thread
-	g_loading = true;
-	StartBackground();
+	g_isInitialized = true;
 
 	MSG msg;
 	while (GetMessageW(&msg, NULL, 0, 0))
@@ -963,6 +1121,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
 		DispatchMessageW(&msg);
 	}
 
+	// Teardown
 	{
 		g_backBuffer.reset();
 

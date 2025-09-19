@@ -41,7 +41,7 @@ static std::atomic<int> g_index{ 0 };
 static std::map<std::wstring, std::shared_ptr<Bitmap>> g_cache;
 static std::mutex g_cacheMutex;
 static std::atomic<bool> g_loading{ false };
-static std::atomic<bool> g_zoom100{ false };
+static std::atomic<DWORD> g_zoom{ 2 };
 static std::atomic<bool> g_stopThreads{ false };
 static int g_frameIndex = 0;
 
@@ -303,29 +303,29 @@ static void CalcRectAndMatrix(UINT w, UINT h, int orient, RECT rc, Matrix& mx, R
 	rect.Width = w;
 	rect.Height = h;
 	double imgAspect = (double)w / h;
-	double ctlW = rc.right - rc.left;
-	double ctlH = rc.bottom - rc.top;
-	double ctlAspect = ctlW / ctlH;
+	double ww = rc.right - rc.left;
+	double wh = rc.bottom - rc.top;
 	rect.X = rc.left;
 	rect.Y = rc.top;
-	if (g_zoom100)
+	if (g_zoom == 0 || (g_zoom == 2 && (w <= ww && h <= wh)))
 	{
-		rect.X += (int)((ctlW - rect.Width) / 2.0);
-		rect.Y += (int)((ctlH - rect.Height) / 2.0);
+		rect.X += (int)((ww - rect.Width) / 2.0);
+		rect.Y += (int)((wh - rect.Height) / 2.0);
 	}
 	else
 	{
-		if (imgAspect > ctlAspect)
+		double wAR = ww / wh;
+		if (imgAspect > wAR)
 		{
-			rect.Width = (int)ctlW;
-			rect.Height = (int)(ctlW / imgAspect);
-			rect.Y += (int)((ctlH - rect.Height) / 2.0);
+			rect.Width = (int)ww;
+			rect.Height = (int)(wh / imgAspect);
+			rect.Y += (int)((wh - rect.Height) / 2.0);
 		}
 		else
 		{
-			rect.Height = (int)ctlH;
-			rect.Width = (int)(ctlH * imgAspect);
-			rect.X += (int)((ctlW - rect.Width) / 2.0);
+			rect.Height = (int)wh;
+			rect.Width = (int)(wh * imgAspect);
+			rect.X += (int)((ww - rect.Width) / 2.0);
 		}
 	}
 
@@ -344,6 +344,21 @@ static void CalcRectAndMatrix(UINT w, UINT h, int orient, RECT rc, Matrix& mx, R
 	}
 }
 
+void ClearCheckeredBackground(Gdiplus::Graphics& g, RECT rc, int tileSize = 16)
+{
+	Gdiplus::SolidBrush light(Gdiplus::Color(255, 30, 30, 30));
+	Gdiplus::SolidBrush dark(Gdiplus::Color(255, 40, 40, 40));
+
+	for (int y = rc.top; y < rc.bottom; y += tileSize)
+	{
+		for (int x = rc.left; x < rc.right; x += tileSize)
+		{
+			bool isLight = ((x / tileSize) + (y / tileSize)) % 2 == 0;
+			g.FillRectangle(isLight ? &light : &dark, x, y, tileSize + 1, tileSize + 1);
+		}
+	}
+}
+
 static std::shared_ptr<Gdiplus::Bitmap> g_backBuffer;
 
 static void DrawImageOntoBackbuffer(RECT rc)
@@ -353,7 +368,7 @@ static void DrawImageOntoBackbuffer(RECT rc)
 	g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
 
 	// clear background
-	g.Clear(Gdiplus::Color(255, 30, 30, 30));
+	ClearCheckeredBackground(g, rc);
 
 	// Utility label
 	Gdiplus::Font font(L"Segoe UI", 18);
@@ -717,7 +732,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		g_hOpenPS = CreateWindowW(L"BUTTON", L"Open with Photoshop", WS_CHILD | WS_VISIBLE | BS_NOTIFY, 200, 620, 160, 28, hWnd, (HMENU)103, g_hInst, NULL);
 		g_hOpenPN = CreateWindowW(L"BUTTON", L"Open with Paint.NET", WS_CHILD | WS_VISIBLE | BS_NOTIFY, 370, 620, 160, 28, hWnd, (HMENU)104, g_hInst, NULL);
 		g_hShowInExplorer = CreateWindowW(L"BUTTON", L"Show in Explorer", WS_CHILD | WS_VISIBLE | BS_NOTIFY, 540, 620, 130, 28, hWnd, (HMENU)105, g_hInst, NULL);
-		g_hToggle100 = CreateWindowW(L"BUTTON", g_zoom100 ? L"100%: On" : L"100%: Off", WS_CHILD | WS_VISIBLE | BS_NOTIFY, 680, 620, 100, 28, hWnd, (HMENU)106, g_hInst, NULL);
+		g_hToggle100 = CreateWindowW(L"BUTTON", g_zoom == 0 ? L"100%" : (g_zoom == 1 ? L"Fit" : L"Shrink"), WS_CHILD | WS_VISIBLE | BS_NOTIFY, 680, 620, 100, 28, hWnd, (HMENU)106, g_hInst, NULL);
 		g_hToggleRec = CreateWindowW(L"BUTTON", g_recursive ? L"Recursive: On" : L"Recursive: Off", WS_CHILD | WS_VISIBLE | BS_NOTIFY, 10, 660, 120, 28, hWnd, (HMENU)107, g_hInst, NULL);
 		g_hRotate = CreateWindowW(L"BUTTON", L"Rotate 90", WS_CHILD | WS_VISIBLE | BS_NOTIFY, 140, 660, 160, 28, hWnd, (HMENU)108, g_hInst, NULL);
 		g_hCopy = CreateWindowW(L"BUTTON", L"Copy", WS_CHILD | WS_VISIBLE | BS_NOTIFY, 310, 660, 100, 28, hWnd, (HMENU)109, g_hInst, NULL);
@@ -765,10 +780,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		break;
 		case 106: // toggle 100%
 		{
-			g_zoom100 = !g_zoom100;
-			DWORD v = g_zoom100;
+			g_zoom = (g_zoom + 1) % 3;
+			DWORD v = g_zoom;
 			RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\ImageViewer", L"Zoom100", REG_DWORD, &v, sizeof(DWORD));
-			SetWindowTextW(g_hToggle100, g_zoom100 ? L"100%: On" : L"100%: Off");
+			SetWindowTextW(g_hToggle100, g_zoom == 0 ? L"100%" : (g_zoom == 1 ? L"Fit" : L"Shrink"));
 			InvalidateRect(g_hPanel, NULL, TRUE);
 			break;
 		}
@@ -888,7 +903,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
 		if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\ImageViewer", L"Recursive", RRF_RT_REG_DWORD, nullptr, &val, &size) == ERROR_SUCCESS)
 			g_recursive = val != 0;
 		if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\ImageViewer", L"Zoom100", RRF_RT_REG_DWORD, nullptr, &val, &size) == ERROR_SUCCESS)
-			g_zoom100 = val != 0;
+			g_zoom = val;
 	}
 
 	// handle command-line arg: accept a single path

@@ -17,6 +17,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <resource.h>
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -26,6 +27,17 @@
 
 using namespace Gdiplus;
 namespace fs = std::filesystem;
+
+struct CacheInfo
+{
+	CacheInfo(const std::shared_ptr<Bitmap>& bmp, const FILETIME& fileTime)
+	{
+		bitmap = bmp;
+		lastWriteTime = fileTime;
+	}
+	std::shared_ptr<Bitmap> bitmap;
+	FILETIME lastWriteTime;
+};
 
 static ULONG_PTR g_gdiplusToken;
 static HWND g_hMain = nullptr;
@@ -38,45 +50,13 @@ static std::atomic<bool> g_recursive{ false };
 static std::vector<fs::path> g_files;
 static std::mutex g_filesMutex;
 static std::atomic<int> g_index{ 0 };
-static std::map<std::wstring, std::shared_ptr<Bitmap>> g_cache;
+static std::map<std::wstring, std::shared_ptr<CacheInfo>> g_cache;
 static std::mutex g_cacheMutex;
 static std::atomic<DWORD> g_zoom{ 2 };
 static std::atomic<bool> g_loading{ false };
 static std::atomic<bool> g_stopThreads{ false };
 static int g_frameIndex = 0;
 static bool g_isInitialized = false;
-
-static void ChooseRootDirectory()
-{
-	// Use IFileDialog to pick a folder (modern folder picker)
-	CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-	IFileDialog* pfd = nullptr;
-	if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfd))))
-	{
-		DWORD dwOptions;
-		if (SUCCEEDED(pfd->GetOptions(&dwOptions)))
-		{
-			pfd->SetOptions(dwOptions | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
-		}
-		if (SUCCEEDED(pfd->Show(g_hMain)))
-		{
-			IShellItem* psi = nullptr;
-			if (SUCCEEDED(pfd->GetResult(&psi)) && psi)
-			{
-				PWSTR pszPath = nullptr;
-				if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &pszPath)) && pszPath)
-				{
-					wcsncpy_s(g_rootPath, pszPath, _TRUNCATE);
-					RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\ImageViewer", L"RootPath", REG_SZ, g_rootPath, (DWORD)((wcslen(g_rootPath) + 1) * sizeof(wchar_t)));
-					CoTaskMemFree(pszPath);
-				}
-				psi->Release();
-			}
-		}
-		pfd->Release();
-	}
-	CoUninitialize();
-}
 
 // helpers
 static inline bool has_ext(const fs::path& p)
@@ -146,33 +126,6 @@ static void EnumFiles()
 	else if (g_index >= (int)g_files.size()) g_index = 0;
 }
 
-static void PreloadAround(int idx)
-{
-	std::lock_guard<std::mutex> lk(g_cacheMutex);
-	if (g_files.empty()) return;
-	int n = (int)g_files.size();
-	auto loadOne = [&](int i)
-		{
-			i = (i % n + n) % n;
-			auto p = g_files[i].wstring();
-			if (g_cache.count(p)) return;
-			Bitmap* bmp = Bitmap::FromFile(p.c_str(), FALSE);
-			if (bmp && bmp->GetLastStatus() == Ok)
-			{
-				g_cache[p] = std::shared_ptr<Bitmap>(bmp);
-			}
-			else delete bmp;
-		};
-	// preload idx-2..idx+2
-	for (int d = -2; d <= 2; ++d) loadOne(idx + d);
-	// trim cache to a small size (keep max 9)
-	while (g_cache.size() > 12)
-	{
-		auto it = g_cache.begin();
-		g_cache.erase(it);
-	}
-}
-
 static std::wstring GetPropertyString(Bitmap* img, PROPID id)
 {
 	// returns raw property item as string or "-" if not present
@@ -239,6 +192,48 @@ static void SetExifOrientation(const std::wstring& file, int val)
 	delete img;
 }
 
+static std::shared_ptr<Bitmap> AssignNewBitmap(const std::wstring& p)
+{
+	// read file into buffer
+	std::ifstream f(p, std::ios::binary);
+	if (!f) return nullptr;
+	std::vector<BYTE> buf((std::istreambuf_iterator<char>(f)), {});
+	if (buf.empty()) return nullptr;
+
+	// make HGLOBAL from buffer
+	HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, buf.size());
+	if (!hMem) return nullptr;
+	void* pMem = GlobalLock(hMem);
+	memcpy(pMem, buf.data(), buf.size());
+	GlobalUnlock(hMem);
+
+	// wrap in IStream
+	IStream* pStream = nullptr;
+	if (FAILED(CreateStreamOnHGlobal(hMem, TRUE, &pStream))) {
+		GlobalFree(hMem);
+		return nullptr;
+	}
+
+	// construct bitmap from stream
+	auto bmp = std::make_shared<Gdiplus::Bitmap>(pStream);
+	pStream->Release(); // Bitmap keeps its own ref
+
+	if (bmp->GetLastStatus() != Gdiplus::Ok) {
+		return nullptr;
+	}
+
+	if (bmp && bmp->GetLastStatus() == Ok)
+	{
+		WIN32_FILE_ATTRIBUTE_DATA fad;
+		GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &fad);
+
+		// We assume cache is locked here!!
+		g_cache[p] = std::shared_ptr<CacheInfo>(new CacheInfo(bmp, fad.ftLastWriteTime));
+		return bmp;
+	}
+	return nullptr;
+}
+
 static std::shared_ptr<Bitmap> GetBitmapAt(int idx)
 {
 	std::wstring p;
@@ -254,22 +249,35 @@ static std::shared_ptr<Bitmap> GetBitmapAt(int idx)
 	{
 		std::lock_guard<std::mutex> clk(g_cacheMutex);
 		auto it = g_cache.find(p);
-		if (it != g_cache.end()) return it->second;
+		if (it != g_cache.end()) return it->second->bitmap;
 	}
 
 	// not cached, load synchronously here (used rarely)
-	Bitmap* b = Bitmap::FromFile(p.c_str(), FALSE);
-	if (b && b->GetLastStatus() == Ok)
+	std::lock_guard<std::mutex> clk(g_cacheMutex);
+	return AssignNewBitmap(p);
+}
+
+static void PreloadAround(int idx)
+{
+	std::lock_guard<std::mutex> lk(g_cacheMutex);
+	if (g_files.empty()) return;
+	int n = (int)g_files.size();
+
+	// preload idx-2..idx+2
+	for (int d = -2; d <= 2; ++d)
 	{
-		auto sp = std::shared_ptr<Bitmap>(b);
-		{
-			std::lock_guard<std::mutex> clk(g_cacheMutex);
-			g_cache[p] = sp;
-		}
-		return sp;
+		auto i = (d % n + n) % n;
+		auto p = g_files[i].wstring();
+		if (g_cache.count(p)) return;
+
+		AssignNewBitmap(p);
 	}
-	delete b;
-	return nullptr;
+	// trim cache to a small size (keep max 9)
+	while (g_cache.size() > 12)
+	{
+		auto it = g_cache.begin();
+		g_cache.erase(it);
+	}
 }
 
 static void BackgroundLoader()
@@ -516,7 +524,61 @@ int VersionToInt(const std::wstring& ver)
 	return major * 1000 + minor;
 }
 
-static void DoOpenWith(const std::wstring& exeHint)
+void OpenFileIn(const std::filesystem::path& installPath, const std::filesystem::path& exeFile)
+{
+	if (installPath.empty())
+	{
+		return;
+	}
+
+	std::filesystem::path exePath = installPath;
+	exePath /= exeFile;
+
+	// Build command line: exe followed by file path
+	fs::path fileToOpen;
+	{
+		std::lock_guard<std::mutex> lk(g_filesMutex);
+		if (g_files.empty()) { return; }
+		fileToOpen = g_files[g_index];
+	}
+	std::wstring cmdLine = L"\"" + exePath.wstring() + L"\" \"" + fileToOpen.wstring() + L"\"";
+
+	STARTUPINFOW si{};
+	PROCESS_INFORMATION pi{};
+	si.cb = sizeof(si);
+
+	if (CreateProcessW(
+		exePath.c_str(),
+		cmdLine.data(),
+		nullptr, nullptr, FALSE, 0,
+		nullptr, nullptr, &si, &pi))
+	{
+		CloseHandle(pi.hThread);
+		CloseHandle(pi.hProcess);
+	}
+}
+
+void OpenInPaintDotNet()
+{
+	REGSAM views[] = { KEY_WOW64_64KEY, KEY_WOW64_32KEY };
+	for (auto view : views)
+	{
+		HKEY hKey;
+		if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\paint.net", 0, KEY_READ | view, &hKey) == ERROR_SUCCESS)
+		{
+			wchar_t path[MAX_PATH];
+			DWORD size = sizeof(path);
+			if (RegQueryValueExW(hKey, L"TARGETDIR", nullptr, nullptr,
+				reinterpret_cast<LPBYTE>(path), &size) == ERROR_SUCCESS)
+			{
+				OpenFileIn(path, L"PaintDotNet.exe");
+			}
+			RegCloseKey(hKey);
+		}
+	}
+}
+
+static void OpenInPhotoshop()
 {
 	std::vector<PhotoshopInstall> installs;
 	HKEY hKey;
@@ -559,21 +621,9 @@ static void DoOpenWith(const std::wstring& exeHint)
 
 	std::sort(installs.begin(), installs.end(), [](const PhotoshopInstall& a, const PhotoshopInstall& b) {
 		return VersionToInt(a.Version) > VersionToInt(b.Version);
-	});
+		});
 
-	// Take the latest version
-	std::filesystem::path photoshopExe = installs.front().Path;
-	photoshopExe /= L"Photoshop.exe";
-
-	fs::path file;
-	{
-		std::lock_guard<std::mutex> lk(g_filesMutex);
-		if (g_files.empty()) { return; }
-		file = g_files[g_index];
-	}
-
-	std::wstring command = L"\"" + photoshopExe.wstring() + L"\" \"" + file.wstring() + L"\"";
-	_wsystem(command.c_str()); // launches Photoshop with the file
+	OpenFileIn(installs.front().Path, L"Photoshop.exe");
 }
 
 HGLOBAL CreateDIBV5FromBitmap(std::shared_ptr<Gdiplus::Bitmap> bmp)
@@ -768,6 +818,7 @@ UINT GetFrameDelay(std::shared_ptr<Gdiplus::Bitmap> bmp, UINT frameIndex)
 }
 
 UINT_PTR g_gifTimerId = 10288; // any unique ID
+UINT_PTR g_fileChangeTimerId = 10289; // any unique ID
 void QueueNextFrame()
 {
 	if (!g_files.empty())
@@ -836,6 +887,69 @@ void SaveWindowPlacement()
 	}
 }
 
+void UpdateRootPath(const fs::path& p)
+{
+	wcsncpy_s(g_rootPath, p.wstring().c_str(), _TRUNCATE);
+	RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\ImageViewer", L"RootPath", REG_SZ, g_rootPath, (DWORD)((wcslen(g_rootPath) + 1) * sizeof(wchar_t)));
+	EnumFiles();
+	g_index = 0;
+}
+
+void SetCurrentRootPath(const std::wstring& path)
+{
+	fs::path p(path);
+	if (fs::exists(p))
+	{
+		if (fs::is_directory(p))
+		{
+			UpdateRootPath(p);
+		}
+		else if (fs::is_regular_file(p))
+		{
+			UpdateRootPath(p.parent_path());
+
+			for (size_t i = 0; i < g_files.size(); ++i)
+			{
+				if (g_files[i] == p)
+				{
+					g_index = (int)i;
+					break;
+				}
+			}
+		}
+	}
+}
+
+static void ChooseRootDirectory()
+{
+	// Use IFileDialog to pick a folder (modern folder picker)
+	CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+	IFileDialog* pfd = nullptr;
+	if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfd))))
+	{
+		DWORD dwOptions;
+		if (SUCCEEDED(pfd->GetOptions(&dwOptions)))
+		{
+			pfd->SetOptions(dwOptions | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+		}
+		if (SUCCEEDED(pfd->Show(g_hMain)))
+		{
+			IShellItem* psi = nullptr;
+			if (SUCCEEDED(pfd->GetResult(&psi)) && psi)
+			{
+				PWSTR pszPath = nullptr;
+				if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &pszPath)) && pszPath)
+				{
+					SetCurrentRootPath(pszPath);
+					CoTaskMemFree(pszPath);
+				}
+				psi->Release();
+			}
+		}
+		pfd->Release();
+	}
+	CoUninitialize();
+}
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -884,14 +998,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		{
 		case 101: PrevImage(); break;
 		case 102: NextImage(); break;
-
-		case 103: // photoshop
-			DoOpenWith(L"C:\\Program Files\\Adobe\\Adobe Photoshop 2023\\Photoshop.exe");
-			break;
-
-		case 104: // paint.net
-			DoOpenWith(L"C:\\Program Files\\paint.net\\PaintDotNet.exe");
-			break;
+		case 103: OpenInPhotoshop(); break;
+		case 104: OpenInPaintDotNet(); break;
 		
 		case 105: // explorer
 			OpenInExplorer();
@@ -950,6 +1058,22 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		if (wParam == g_gifTimerId)
 		{
 			QueueNextFrame();
+		}
+		else if (wParam == g_fileChangeTimerId)
+		{
+			//auto bmp = GetBitmapAt(g_index);
+			//WIN32_FILE_ATTRIBUTE_DATA fad;
+			//if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad))
+			//{
+			//	// File not accessible (deleted/moved?)
+			//	return false;
+			//}
+			//
+			//// Compare against stored timestamp
+			//if (CompareFileTime(&fad.ftLastWriteTime, &lastWriteTime) != 0)
+			//{
+			//	lastWriteTime = fad.ftLastWriteTime;
+			//}
 		}
 		break;
 
@@ -1026,7 +1150,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	return r;
 }
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow)
 {
 	g_hInst = hInstance;
 	// GDI+
@@ -1035,20 +1159,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
 	INITCOMMONCONTROLSEX icce = { sizeof(icce), ICC_STANDARD_CLASSES };
 	InitCommonControlsEx(&icce);
 
-	// initial root path -> current directory
-	std::wstring cur = fs::current_path().wstring();
-	wcsncpy_s(g_rootPath, cur.c_str(), _TRUNCATE);
-
 	{
-		DWORD type = REG_SZ;
-		wchar_t buf[MAX_PATH];
-		DWORD size = sizeof(buf);
-		if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\ImageViewer", L"RootPath", RRF_RT_REG_SZ, &type, buf, &size) == ERROR_SUCCESS) {
-			wcsncpy_s(g_rootPath, buf, _TRUNCATE);
-			g_index = 0;
-		}
-
 		DWORD val = 0;
+		DWORD size = sizeof(val);
 		if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\ImageViewer", L"Recursive", RRF_RT_REG_DWORD, nullptr, &val, &size) == ERROR_SUCCESS)
 			g_recursive = val != 0;
 		if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\ImageViewer", L"Zoom100", RRF_RT_REG_DWORD, nullptr, &val, &size) == ERROR_SUCCESS)
@@ -1062,29 +1175,25 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
 	{
 		if (argc > 1)
 		{
-			fs::path p(argv[1]);
-			if (fs::exists(p))
-			{
-				if (fs::is_regular_file(p))
-				{
-					// show this file and set root dir to its parent
-					wcsncpy_s(g_rootPath, p.parent_path().wstring().c_str(), _TRUNCATE);
-					// find index
-					for (size_t i = 0; i < g_files.size(); ++i) if (g_files[i] == p) { g_index = (int)i; break; }
-				}
-				else if (fs::is_directory(p))
-				{
-					wcsncpy_s(g_rootPath, p.wstring().c_str(), _TRUNCATE);
-					g_index = 0;
-				}
-			}
+			SetCurrentRootPath(argv[1]);
 		}
 		LocalFree(argv);
 	}
 
-	if (wcslen(g_rootPath))
+	if (!*g_rootPath)
 	{
-		EnumFiles();
+		DWORD type = REG_SZ;
+		wchar_t buf[MAX_PATH];
+		DWORD size = sizeof(buf);
+		if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\ImageViewer", L"RootPath", RRF_RT_REG_SZ, &type, buf, &size) == ERROR_SUCCESS) {
+			SetCurrentRootPath(buf);
+		}
+
+		if (!*g_rootPath)
+		{
+			// initial root path = current directory
+			SetCurrentRootPath(fs::current_path());
+		}
 	}
 
 	WNDCLASSEXW wc = { sizeof(wc) };
@@ -1093,6 +1202,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
 	wc.hInstance = hInstance;
 	wc.hCursor = LoadCursor(NULL, IDC_ARROW);
 	wc.lpszClassName = L"MinimalImgViewerClass";
+	wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCE(IDI_APP));
 	RegisterClassExW(&wc);
 
 	g_hMain = CreateWindowExW(0, wc.lpszClassName, L"Minimal Image Viewer", WS_OVERLAPPEDWINDOW,
@@ -1111,6 +1221,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
 
 	ShowWindow(g_hMain, wp.showCmd);
 	UpdateWindow(g_hMain);
+
+	SetTimer(g_hMain, g_fileChangeTimerId, 333, NULL); // 3x a second
 
 	g_isInitialized = true;
 
